@@ -91,7 +91,7 @@ If compiling successful, you can see the `dist` directory , which contains the c
 * Modify Grafana configuration file: the file is in（`${Grafana directory}\conf\defaults.ini`）, and do the following modifications:
 
   ```ini
-  allow_loading_unsigned_plugins = iotdb
+  allow_loading_unsigned_plugins = iotdb-datasource
   ```
 * Modify the location of Grafana's plugin directory: the file is in（`${Grafana directory}\conf\defaults.ini`）, and do the following modifications:
 
