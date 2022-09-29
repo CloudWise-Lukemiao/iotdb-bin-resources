@@ -21,8 +21,11 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
+	"strconv"
+	"strings"
 	"time"
 
 	"github.com/grafana/grafana-plugin-sdk-go/backend"
@@ -98,7 +101,27 @@ type dataSourceModel struct {
 	Url      string `json:"url"`
 }
 
+type groupBy struct {
+	GroupByLevel     string `json:"groupByLevel"`
+	SamplingInterval string `json:"samplingInterval"`
+	Step             string `json:"step"`
+}
+
 type queryParam struct {
+	Expression   []string `json:"expression"`
+	PrefixPath   []string `json:"prefixPath"`
+	StartTime    int64    `json:"startTime"`
+	EndTime      int64    `json:"endTime"`
+	Condition    string   `json:"condition"`
+	Control      string   `json:"control"`
+	SqlType      string   `json:"sqlType"`
+	Paths        []string `json:"paths"`
+	AggregateFun string   `json:"aggregateFun"`
+	FillClauses  string   `json:"fillClauses"`
+	GroupBy      groupBy  `json:"groupBy"`
+}
+
+type QueryDataReq struct {
 	Expression []string `json:"expression"`
 	PrefixPath []string `json:"prefixPath"`
 	StartTime  int64    `json:"startTime"`
@@ -110,13 +133,19 @@ type queryParam struct {
 type QueryDataResponse struct {
 	Expressions []string    `json:"expressions"`
 	Timestamps  []int64     `json:"timestamps"`
-	Values      [][]float32 `json:"values"`
+	Values      [][]interface{} `json:"values"`
 	ColumnNames interface{} `json:"columnNames"`
+	Code        int32       `json:"code"`
+	Message     string      `json:"message"`
 }
 
 type loginStatus struct {
 	Code    int    `json:"code"`
 	Message string `json:"message"`
+}
+
+func NewQueryDataReq(expression []string, prefixPath []string, startTime int64, endTime int64, condition string, control string) *QueryDataReq {
+	return &QueryDataReq{Expression: expression, PrefixPath: prefixPath, StartTime: startTime, EndTime: endTime, Condition: condition, Control: control}
 }
 
 func (d *IoTDBDataSource) query(cxt context.Context, pCtx backend.PluginContext, query backend.DataQuery) backend.DataResponse {
@@ -125,6 +154,7 @@ func (d *IoTDBDataSource) query(cxt context.Context, pCtx backend.PluginContext,
 
 	// Unmarshal the JSON into our queryModel.
 	var qp queryParam
+	var qdReq QueryDataReq
 	response.Error = json.Unmarshal(query.JSON, &qp)
 	if response.Error != nil {
 		return response
@@ -133,10 +163,37 @@ func (d *IoTDBDataSource) query(cxt context.Context, pCtx backend.PluginContext,
 	qp.EndTime = query.TimeRange.To.UnixNano() / 1000000
 
 	client := &http.Client{}
-	qpJson, _ := json.Marshal(qp)
+	if qp.SqlType == "SQL: Drop-down List" {
+		qp.Control = ""
+		var expressions []string = qp.Paths[len(qp.Paths)-1:]
+		var paths []string = qp.Paths[0 : len(qp.Paths)-1]
+		path := "root." + strings.Join(paths, ".")
+		var prefixPaths = []string{path}
+		if qp.AggregateFun != "" {
+			expressions[0] = qp.AggregateFun + "(" + expressions[0] + ")"
+		}
+		if qp.GroupBy.SamplingInterval != "" && qp.GroupBy.Step == "" {
+			qp.Control += " group by([" + strconv.FormatInt(qp.StartTime, 10) + "," + strconv.FormatInt(qp.EndTime, 10) + ")," + qp.GroupBy.SamplingInterval + ")"
+		}
+		if qp.GroupBy.SamplingInterval != "" && qp.GroupBy.Step != "" {
+			qp.Control += " group by([" + strconv.FormatInt(qp.StartTime, 10) + "," + strconv.FormatInt(qp.EndTime, 10) + ")," + qp.GroupBy.SamplingInterval + "," + qp.GroupBy.Step + ")"
+		}
+		if qp.GroupBy.GroupByLevel != "" {
+			qp.Control += " " + qp.GroupBy.GroupByLevel
+		}
+		if qp.FillClauses != "" {
+			qp.Control += " fill" + qp.FillClauses
+		}
+		qdReq = *NewQueryDataReq(expressions, prefixPaths, qp.StartTime, qp.EndTime, qp.Condition, qp.Control)
+	} else if qp.SqlType == "SQL: Full Customized" {
+		qdReq = *NewQueryDataReq(qp.Expression, qp.PrefixPath, qp.StartTime, qp.EndTime, qp.Condition, qp.Control)
+	} else {
+		return response
+	}
+	qpJson, _ := json.Marshal(qdReq)
 	reader := bytes.NewReader(qpJson)
 
-  var dataSourceUrl = DataSourceUrlHandler(d.Ulr);
+	var dataSourceUrl = DataSourceUrlHandler(d.Ulr)
 
 	request, _ := http.NewRequest(http.MethodPost, dataSourceUrl+"/grafana/v1/query/expression", reader)
 	request.Header.Set("Content-Type", "application/json")
@@ -155,16 +212,20 @@ func (d *IoTDBDataSource) query(cxt context.Context, pCtx backend.PluginContext,
 	}
 
 	defer rsp.Body.Close()
+	if queryDataResp.Code > 0 {
+		response.Error = errors.New(queryDataResp.Message)
+		log.DefaultLogger.Error(queryDataResp.Message)
 
+	}
 	// create data frame response.
 	frame := data.NewFrame("response")
 	for i := 0; i < len(queryDataResp.Expressions); i++ {
 		times := make([]time.Time, len(queryDataResp.Timestamps))
-		values := make([]float32, len(queryDataResp.Timestamps))
 		for c := 0; c < len(queryDataResp.Timestamps); c++ {
 			times[c] = time.Unix(queryDataResp.Timestamps[c]/1000, 0)
-			values[c] = queryDataResp.Values[i][c]
 		}
+		values :=  recoverType(queryDataResp.Values[i])
+
 		frame.Fields = append(frame.Fields,
 			data.NewField("time", nil, times),
 			data.NewField(queryDataResp.Expressions[i], nil, values),
@@ -175,13 +236,50 @@ func (d *IoTDBDataSource) query(cxt context.Context, pCtx backend.PluginContext,
 	return response
 }
 
+func recoverType(m []interface{}) interface{} {
+    if len(m) > 0 {
+        switch m[0].(type) {
+        case float64:
+            tmp := make([]float64, len(m))
+            for i := range m {
+                tmp[i] = m[i].(float64)
+            }
+            return tmp
+        case string:
+            tmp := make([]string, len(m))
+            for i := range m {
+                tmp[i] = m[i].(string)
+            }
+            return tmp
+        case bool:
+            tmp := make([]float64, len(m))
+            for i := range m {
+                if m[i].(bool) {
+                    tmp[i] = 1
+                } else {
+                    tmp[i] = 0
+                }
+            }
+            return tmp
+        default:
+            tmp := make([]float64, len(m))
+            for i := range m {
+                tmp[i] = 0
+            }
+            return tmp
+        }
+    } else {
+        return make([]float64, 0)
+    }
+}
+
 // Whether the last character of the URL for processing datasource configuration is "/"
-func DataSourceUrlHandler(url string) string{
-  var lastCharacter  = url[len(url)-1:len(url)]
-  if lastCharacter == "/"{
-    url = url[0:len(url)-1]
-  }
-  return url;
+func DataSourceUrlHandler(url string) string {
+	var lastCharacter = url[len(url)-1 : len(url)]
+	if lastCharacter == "/" {
+		url = url[0 : len(url)-1]
+	}
+	return url
 }
 
 // CheckHealth handles health checks sent from Grafana to the plugin.
@@ -194,7 +292,7 @@ func (d *IoTDBDataSource) CheckHealth(_ context.Context, req *backend.CheckHealt
 	var status = backend.HealthStatusError
 	var message = "Data source is not working properly"
 
-  var dataSourceUrl = DataSourceUrlHandler(d.Ulr);
+	var dataSourceUrl = DataSourceUrlHandler(d.Ulr)
 
 	client := &http.Client{}
 	request, err := http.NewRequest(http.MethodGet, dataSourceUrl+"/grafana/v1/login", nil)
